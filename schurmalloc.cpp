@@ -161,6 +161,7 @@ void* Schurmalloc::realloc(void* ptr, std::size_t newSize)
 
     if (newSize < block->size)
     {
+        std::cout << "\trealloc: Shrinking block...\n";
         // Split block into a reserved block of newSize and a free block of size - newSize.
         // The reserved block stays where it is, so don't touch ptr.
         bool split = trySplitBlock(block, newSize);
@@ -168,10 +169,12 @@ void* Schurmalloc::realloc(void* ptr, std::size_t newSize)
         // Sanity checks...
         if (split)
         {
+            std::cout << "\trealloc: We've split the block in order to shrink\n";
             assert(block->size == newSize);
         }
         else
         {
+            std::cout << "\trealloc: Actually didn't shrink block, because the shrink is < metadata size\n";
             // If split didn't happen, it's because diff between size and newSize isn't enough for metadata.
             assert(block->size - newSize <= sizeof(Header) + sizeof(Footer));
             assert(block->size > newSize);
@@ -179,11 +182,13 @@ void* Schurmalloc::realloc(void* ptr, std::size_t newSize)
     }
     else if (newSize > block->size)
     {
+        std::cout << "\trealloc: Expanding block...\n";
         if (!isLastBlock(getFooter(block)) && // Can we expand block into the following block?
             getNextHeader(block)->free &&
             block->size + sizeof(Footer) + sizeof(Header) + getNextHeader(block)->size >= newSize)
         {
             // Expand block into following block
+            std::cout << "\trealloc: Expanding block into the following block...\n";
             Header* freeHeader = getNextHeader(block);
             Footer* freeFooter = getFooter(freeHeader);
             assert(freeHeader->free);
@@ -213,6 +218,10 @@ void* Schurmalloc::realloc(void* ptr, std::size_t newSize)
                 getHeader(freeFooter)->free = true;
                 getHeader(freeFooter)->prev = prev;
                 getHeader(freeFooter)->next = next;
+                if (getHeader(freeFooter)->prev == NULL)
+                {
+                    freeList = getHeader(freeFooter);
+                }
                 
                 block->size = newSize;
                 assert(getFooter(block) == getPrevFooter(getHeader(freeFooter)));
@@ -225,6 +234,7 @@ void* Schurmalloc::realloc(void* ptr, std::size_t newSize)
                  getPrevFooter(block)->size + sizeof(Footer) + sizeof(Header) + block->size >= newSize)
         {
             // Expand block into preceding block
+            std::cout << "\trealloc: Expanding block into preceding block...\n";
             Header* prevHeader = getPrevHeader(block);
             Footer* prevFooter = getFooter(prevHeader);
             Footer* blockFooter = getFooter(block);
@@ -256,19 +266,20 @@ void* Schurmalloc::realloc(void* ptr, std::size_t newSize)
                 getFooter(prevHeader)->size = remainderSize;
                 getFooter(prevHeader)->free = true;
                 
-                blockFooter->size = remainderSize;
-                getHeader(blockFooter)->size = remainderSize;
+                blockFooter->size = newSize;
+                getHeader(blockFooter)->size = newSize;
                 getHeader(blockFooter)->free = false;
                 getHeader(blockFooter)->prev = NULL;
                 getHeader(blockFooter)->next = NULL;
 
-                std::memmove(getPayload(prevHeader), ptr, newSize);
-                ptr = getPayload(prevHeader);
+                std::memmove(getPayload(getHeader(blockFooter)), ptr, newSize);
+                ptr = getPayload(getHeader(blockFooter));
             }
         }
         else
         {
             // We need to try to malloc a new block, since we can't expand in place.
+            std::cout << "\trealloc: Can't expand in place. Need to malloc new block\n";
             ptr = this->malloc(newSize);
             if (ptr)
             {
@@ -311,7 +322,7 @@ void Schurmalloc::free(void* ptr)
     // Insert this new free block into the free list
     if (freeList == NULL) // block is the only free block
     {
-        std::cout << "\tFreelist is NULL, so making block-to-free the only free block.\n";
+        std::cout << "\tfree: Freelist is NULL, so making block-to-free the only free block.\n";
         freeList = block;
         block->prev = NULL;
         block->next = NULL;
@@ -319,7 +330,7 @@ void Schurmalloc::free(void* ptr)
     }
     else if (block < freeList) // block is to be the first element in the free list
     {
-        std::cout << "\tBlock to free is prior to other free blocks.\n";
+        std::cout << "\tfree: Block to free is prior to other free blocks.\n";
         block->prev = NULL;
         block->next = freeList;
         freeList->prev = block;
@@ -327,7 +338,7 @@ void Schurmalloc::free(void* ptr)
     }
     else // traverse the free list to find where block belongs
     {
-        std::cout << "\tTraversing freelist to find where to put block-to-free.\n";
+        std::cout << "\tfree: Traversing freelist to find where to put block-to-free.\n";
         Header* prev = NULL;
         Header* next = freeList;
         while (next && block > next)
@@ -345,7 +356,7 @@ void Schurmalloc::free(void* ptr)
     if (!isFirstBlock(block) && // If this is the first block, don't look at prev block!
         getPrevFooter(block)->free)
     {
-        std::cout << "\tCoalescing newly freed block with previous block...\n";
+        std::cout << "\tfree: Coalescing newly freed block with previous block...\n";
         block = coalesce(getPrevHeader(block), block);
     }
 
@@ -353,7 +364,7 @@ void Schurmalloc::free(void* ptr)
     if (!isLastBlock(footer) &&
         getNextHeader(footer)->free)
     {
-        std::cout << "\tCoalescing newly freed block with subsequent block...\n";
+        std::cout << "\tfree: Coalescing newly freed block with subsequent block...\n";
         block = coalesce(block, getNextHeader(block));
     }
 }
