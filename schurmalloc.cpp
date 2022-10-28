@@ -1,7 +1,13 @@
 #include "schurmalloc.h"
 #include <iostream>
 #include <cstddef>
+#include <cstring>
 #include <cassert>
+
+void* Schurmalloc::getPayload(Header* header)
+{
+    return static_cast<void*>(reinterpret_cast<char*>(header) + sizeof(Header));
+}
 
 Schurmalloc::Footer* Schurmalloc::getFooter(Header* header)
 {
@@ -11,6 +17,11 @@ Schurmalloc::Footer* Schurmalloc::getFooter(Header* header)
 Schurmalloc::Header* Schurmalloc::getHeader(void* payload)
 {
     return reinterpret_cast<Header*>(static_cast<char*>(payload) - sizeof(Header));
+}
+
+Schurmalloc::Header* Schurmalloc::getHeader(Footer* footer)
+{
+    return reinterpret_cast<Header*>(reinterpret_cast<char*>(footer) - footer->size - sizeof(Header));
 }
 
 Schurmalloc::Header* Schurmalloc::getPrevHeader(Header* header)
@@ -73,7 +84,7 @@ Schurmalloc::Schurmalloc(void* mem, std::size_t size)
 
 void* Schurmalloc::malloc(std::size_t size)
 {
-    if (size == 0 || size >= memorySize)
+    if (size == 0 || size >= memorySize || freeList == NULL)
     {
         return NULL;
     }
@@ -88,27 +99,11 @@ void* Schurmalloc::malloc(std::size_t size)
             // First, create a new free block out of the remainder, if there's enough remainder.
             trySplitBlock(block, size);
 
-            // Then, connect prev block to next block.
-            if (block->prev)
-            {
-                block->prev->next = block->next;
-            }
-            else
-            {
-                // There is no previous block. That means that we're reserving the head of the
-                // free list. The free list needs to get a new head.
-                freeList = block->next;
-            }
+            // Then, reserve the block...
+            reserve(block);
 
-            if (block->next)
-            {
-                block->next->prev = block->prev;
-            }
-
-            // Finally, mark block as reserved and return a pointer to the addr after the header
-            block->free = getFooter(block)->free = false;
-            block->prev = block->next = NULL;
-            return static_cast<void*>(reinterpret_cast<char*>(block) + sizeof(Header));
+            // Finally, return a pointer to the address after the header
+            return getPayload(block);
         }
         else if (block->next)
         {
@@ -121,18 +116,184 @@ void* Schurmalloc::malloc(std::size_t size)
     }
 }
 
-/*
+void Schurmalloc::reserve(Header* block)
+{
+    assert(block);
+    assert(block->free);
+    assert(getFooter(block)->free);
+    assert(block->size == getFooter(block)->size);
+
+    if (block->prev)
+    {
+        block->prev->next = block->next;
+    }
+    else
+    {
+        // There is no previous block. That means that we're reserving the head of the
+        // free list. The free list needs to get a new head.
+        freeList = block->next;
+    }
+
+    if (block->next)
+    {
+        block->next->prev = block->prev;
+    }
+
+    block->free = false;
+    getFooter(block)->free = false;
+    block->prev = NULL;
+    block->next = NULL;
+}
+
 void* Schurmalloc::realloc(void* ptr, std::size_t newSize)
 {
+    if (ptr == NULL)
+    {
+        return malloc(newSize);
+    }
     if (newSize == 0)
     {
-        free(ptr);
+        this->free(ptr);
         return NULL;
     }
 
-    // TODO Implement realloc
+    Header* block = getHeader(ptr);
+
+    if (newSize < block->size)
+    {
+        // Split block into a reserved block of newSize and a free block of size - newSize.
+        // The reserved block stays where it is, so don't touch ptr.
+        bool split = trySplitBlock(block, newSize);
+
+        // Sanity checks...
+        if (split)
+        {
+            assert(block->size == newSize);
+        }
+        else
+        {
+            // If split didn't happen, it's because diff between size and newSize isn't enough for metadata.
+            assert(block->size - newSize <= sizeof(Header) + sizeof(Footer));
+            assert(block->size > newSize);
+        }
+    }
+    else if (newSize > block->size)
+    {
+        if (!isLastBlock(getFooter(block)) && // Can we expand block into the following block?
+            getNextHeader(block)->free &&
+            block->size + sizeof(Footer) + sizeof(Header) + getNextHeader(block)->size >= newSize)
+        {
+            // Expand block into following block
+            Header* freeHeader = getNextHeader(block);
+            Footer* freeFooter = getFooter(freeHeader);
+            assert(freeHeader->free);
+            assert(freeFooter->free);
+            assert(freeHeader->size == freeFooter->size);
+            size_t availableSize = block->size + sizeof(Footer) + sizeof(Header) + freeHeader->size;
+            if (availableSize == newSize)
+            {
+                // We have exactly enough bytes in the subsequent block to hold our realloc'd data.
+                // This means that the subsequent block needs to be taken out of the free list, and
+                // the footer of the subsequent block will become our new footer.
+                reserve(freeHeader);
+                block->size = newSize;
+                assert(getFooter(block) == freeFooter);
+                freeFooter->size = newSize;
+            }
+            else
+            {
+                // The subsequent block will be shrunk, but it will maintain its place in the free list.
+                assert(availableSize > newSize);
+                size_t remainderSize = freeHeader->size - (newSize - block->size);
+                Header* prev = freeHeader->prev;
+                Header* next = freeHeader->next;
+                freeFooter->size = remainderSize;
+                assert(getHeader(freeFooter) == reinterpret_cast<Header*>(reinterpret_cast<char*>(freeHeader) + (newSize - block->size)));
+                getHeader(freeFooter)->size = remainderSize;
+                getHeader(freeFooter)->free = true;
+                getHeader(freeFooter)->prev = prev;
+                getHeader(freeFooter)->next = next;
+                
+                block->size = newSize;
+                assert(getFooter(block) == getPrevFooter(getHeader(freeFooter)));
+                getFooter(block)->size = newSize;
+                getFooter(block)->free = false;
+            }
+        }
+        else if (!isFirstBlock(block) && // Can we expand block into the preceding block?
+                 getPrevFooter(block)->free &&
+                 getPrevFooter(block)->size + sizeof(Footer) + sizeof(Header) + block->size >= newSize)
+        {
+            // Expand block into preceding block
+            Header* prevHeader = getPrevHeader(block);
+            Footer* prevFooter = getFooter(prevHeader);
+            Footer* blockFooter = getFooter(block);
+            assert(prevHeader->free);
+            assert(prevFooter->free);
+            assert(prevHeader->size == prevFooter->size);
+            assert(!blockFooter->free);
+            assert(block->size == blockFooter->size);
+            size_t availableSize = prevHeader->size + sizeof(Footer) + sizeof(Header) + block->size;
+            if (availableSize == newSize)
+            {
+                // We have exactly enough bytes in the preceding block to hold our realloc'd data.
+                // This means that the preceding block needs to be taken out of the free list, and
+                // the header of the preceding block becomes our new header.
+                reserve(prevHeader);
+                prevHeader->size = newSize;
+                assert(getFooter(prevHeader) == blockFooter);
+                getFooter(prevHeader)->size = newSize;
+                std::memmove(getPayload(prevHeader), ptr, newSize);
+                ptr = getPayload(prevHeader);
+            }
+            else
+            {
+                // The preceding block will be shrunk, but it will maintain its place in the free list.
+                assert(availableSize > newSize);
+                size_t remainderSize = prevHeader->size - (newSize - block->size);
+
+                prevHeader->size = remainderSize;
+                getFooter(prevHeader)->size = remainderSize;
+                getFooter(prevHeader)->free = true;
+                
+                blockFooter->size = remainderSize;
+                getHeader(blockFooter)->size = remainderSize;
+                getHeader(blockFooter)->free = false;
+                getHeader(blockFooter)->prev = NULL;
+                getHeader(blockFooter)->next = NULL;
+
+                std::memmove(getPayload(prevHeader), ptr, newSize);
+                ptr = getPayload(prevHeader);
+            }
+        }
+        else
+        {
+            // We need to try to malloc a new block, since we can't expand in place.
+            ptr = this->malloc(newSize);
+            if (ptr)
+            {
+                // Copy the old block's data into the new one.
+                // (We can use memcpy because we know for sure the blocks don't overlap.)
+                std::memcpy(ptr, getPayload(block), block->size);
+
+                // Now that we're done with the old block, free it.
+                free(getPayload(block));
+            }
+        }
+    }
+    // Do nothing to the block if newSize == block->size
+
+    // Sanity checks...
+    if (ptr)
+    {
+        Header* b = getHeader(ptr);
+        assert(b->size >= newSize);
+        assert(b->size == getFooter(b)->size);
+        assert(!b->free);
+        assert(!getFooter(b)->free);
+    }
+    return ptr;
 }
-*/
 
 void Schurmalloc::free(void* ptr)
 {
@@ -150,7 +311,7 @@ void Schurmalloc::free(void* ptr)
     // Insert this new free block into the free list
     if (freeList == NULL) // block is the only free block
     {
-        std::cout << "Freelist is NULL, so making block-to-free the only free block.\n";
+        std::cout << "\tFreelist is NULL, so making block-to-free the only free block.\n";
         freeList = block;
         block->prev = NULL;
         block->next = NULL;
@@ -158,7 +319,7 @@ void Schurmalloc::free(void* ptr)
     }
     else if (block < freeList) // block is to be the first element in the free list
     {
-        std::cout << "Block to free is prior to other free blocks.\n";
+        std::cout << "\tBlock to free is prior to other free blocks.\n";
         block->prev = NULL;
         block->next = freeList;
         freeList->prev = block;
@@ -166,7 +327,7 @@ void Schurmalloc::free(void* ptr)
     }
     else // traverse the free list to find where block belongs
     {
-        std::cout << "Traversing freelist to find where to put block-to-free.\n";
+        std::cout << "\tTraversing freelist to find where to put block-to-free.\n";
         Header* prev = NULL;
         Header* next = freeList;
         while (next && block > next)
@@ -184,7 +345,7 @@ void Schurmalloc::free(void* ptr)
     if (!isFirstBlock(block) && // If this is the first block, don't look at prev block!
         getPrevFooter(block)->free)
     {
-        std::cout << "Coalescing newly freed block with previous block...\n";
+        std::cout << "\tCoalescing newly freed block with previous block...\n";
         block = coalesce(getPrevHeader(block), block);
     }
 
@@ -192,22 +353,17 @@ void Schurmalloc::free(void* ptr)
     if (!isLastBlock(footer) &&
         getNextHeader(footer)->free)
     {
-        std::cout << "Coalescing newly freed block with subsequent block...\n";
+        std::cout << "\tCoalescing newly freed block with subsequent block...\n";
         block = coalesce(block, getNextHeader(block));
     }
 }
 
 bool Schurmalloc::trySplitBlock(Header* block, std::size_t size)
 {
-    if (block->size <= size || !block->free)
-    {
-        return false;
-    }
-
     // Sanity checks...
+    assert(block);
     assert(block->size == getFooter(block)->size);
-    assert(block->free);
-    assert(getFooter(block)->free);
+    assert(block->free == getFooter(block)->free);
 
     /* When the block is split, this will be what happens:
     |------------------------------------------------------------------------|
@@ -218,14 +374,15 @@ bool Schurmalloc::trySplitBlock(Header* block, std::size_t size)
     | Header | size bytes | NewFooter | NewHeader | remainder bytes | Footer |
     |------------------------------------------------------------------------| */
 
-    // Knowing that this is how the block will split, we can calculate the remainder:
-    std::size_t remainder = block->size - size - sizeof(Footer) - sizeof(Header);
-
-    if (remainder == 0)
+    // Make sure there's enough remainder bytes for us to be able to split.
+    // (Do this check before calculating remainder, because size_t is unsigned, which could lead to
+    // some underflow funkiness if, e.g., block->size == size.)
+    if (size + sizeof(Footer) + sizeof(Header) >= block->size)
     {
-        // The residual block isn't large enough for both metadata and data.
+        // The remainder is <= 0. The residual block isn't large enough for both metadata and data.
         return false;
     }
+    std::size_t remainder = block->size - size - sizeof(Footer) - sizeof(Header);
 
     Header* remainderHeader = reinterpret_cast<Header*>(reinterpret_cast<char*>(block) +
                                                         sizeof(Header) +
@@ -237,22 +394,34 @@ bool Schurmalloc::trySplitBlock(Header* block, std::size_t size)
                                                    size);
     remainderHeader->size = remainder;
     remainderFooter->size = remainder;
-    remainderHeader->free = true;
-    remainderFooter->free = true;
-    remainderHeader->prev = block;
-    remainderHeader->next = block->next;
-    
     block->size = size;
     thisFooter->size = size;
-    thisFooter->free = true;
-    block->next = remainderHeader;
+    thisFooter->free = block->free;
+
+    if (block->free)
+    {
+        remainderHeader->free = true;
+        remainderFooter->free = true;
+        remainderHeader->prev = block;
+        remainderHeader->next = block->next;
+        block->next = remainderHeader;
+
+        // Sanity checks...
+        assert(block->next == getNextHeader(block));
+        assert(getNextHeader(block)->prev == block);
+    }
+    else // Block isn't free, but the remainder will be made free
+    {
+        remainderHeader->free = false;
+        remainderFooter->free = false;
+        remainderHeader->prev = NULL;
+        remainderHeader->next = NULL;
+        this->free(getPayload(remainderHeader));
+    }
 
     // Sanity checks...
     assert(block->size == getFooter(block)->size);
-    assert(block->free);
-    assert(getFooter(block)->free);
-    assert(block->next == getNextHeader(block));
-    assert(getNextHeader(block)->prev == block);
+    assert(block->free == getFooter(block)->free);
     assert(getNextHeader(block)->size == getFooter(getNextHeader(block))->size);
     assert(getNextHeader(block)->free);
     assert(getFooter(getNextHeader(block))->free);
